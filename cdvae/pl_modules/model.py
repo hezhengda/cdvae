@@ -14,11 +14,21 @@ from cdvae.common.utils import PROJECT_ROOT
 from cdvae.common.data_utils import (
     EPSILON, cart_to_frac_coords, mard, lengths_angles_to_volume,
     frac_to_cart_coords, min_distance_sqr_pbc)
-from cdvae.pl_modules.embeddings import MAX_ATOMIC_NUM
-from cdvae.pl_modules.embeddings import KHOT_EMBEDDINGS
+from cdvae.pl_modules.embeddings import MAX_ATOMIC_NUM # MAX_ATOMIC_NUM = 100 in pl_modules/embeddings/__init__.py
+from cdvae.pl_modules.embeddings import KHOT_EMBEDDINGS # length of the vector = 92
 
 
 def build_mlp(in_dim, hidden_dim, fc_num_layers, out_dim):
+    """Added by Zheng-Da He
+    Construct the multi-layer perceptron (MLP), basically means a feed-forward neural network.    
+
+    Architecture: in_dim ==> hidden_dim ==> ... ==> hidden_dim ==> out_dim
+
+    in_dim: dimension of input feature
+    hidden_dim: dimension of hidden layer
+    fc_num_layers: number of fully-connected layers
+    out_dim: dimension of output
+    """
     mods = [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
     for i in range(fc_num_layers-1):
         mods += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
@@ -30,7 +40,7 @@ class BaseModule(pl.LightningModule):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
         # populate self.hparams with args and kwargs automagically!
-        self.save_hyperparameters()
+        self.save_hyperparameters() # Q: What are those hyperparameters? Where can I find them?
 
     def configure_optimizers(self):
         opt = hydra.utils.instantiate(
@@ -134,51 +144,82 @@ class CrystGNN_Supervise(BaseModule):
 
 
 class CDVAE(BaseModule):
+    """Added by Zheng-Da He
+    The central model for CDVAE architecture
+    """
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
+        # initialize the encoder NN
+        # the _target_ for encoder is: cdvae.pl_modules.gnn.DimeNetPlusPlusWrap (meaning this is the object being created)
+        # the config file for encoder is at: cdvae/conf/model/encoder/dimenet.yaml
         self.encoder = hydra.utils.instantiate(
             self.hparams.encoder, num_targets=self.hparams.latent_dim)
+        # num_targets is the dimension of latent variable
+
+        # initialize the decoder NN 
+        # the _target_ for decoder is: cdvae.pl_modules.decoder.GemNetTDecoder
+        # the config file for decoder is at: cdvae/conf/model/decoder/gemnet.yaml
         self.decoder = hydra.utils.instantiate(self.hparams.decoder)
 
+        # fc means fully-connected, mu is the vector of mean, the length is the same as z
         self.fc_mu = nn.Linear(self.hparams.latent_dim,
                                self.hparams.latent_dim)
+        # var is the variance
         self.fc_var = nn.Linear(self.hparams.latent_dim,
                                 self.hparams.latent_dim)
 
-        self.fc_num_atoms = build_mlp(self.hparams.latent_dim, self.hparams.hidden_dim,
-                                      self.hparams.fc_num_layers, self.hparams.max_atoms+1)
-        self.fc_lattice = build_mlp(self.hparams.latent_dim, self.hparams.hidden_dim,
-                                    self.hparams.fc_num_layers, 6)
-        self.fc_composition = build_mlp(self.hparams.latent_dim, self.hparams.hidden_dim,
-                                        self.hparams.fc_num_layers, MAX_ATOMIC_NUM)
-        # for property prediction.
-        if self.hparams.predict_property:
-            self.fc_property = build_mlp(self.hparams.latent_dim, self.hparams.hidden_dim,
-                                         self.hparams.fc_num_layers, 1)
+        # NN for predicting number of atoms from latent variable z
+        self.fc_num_atoms = build_mlp(in_dim=self.hparams.latent_dim, 
+                                      hidden_dim=self.hparams.hidden_dim,
+                                      fc_num_layers=self.hparams.fc_num_layers, 
+                                      out_dim=self.hparams.max_atoms+1) # Q: Why +1 in here? [Because we want a vector from 0 to max_atoms, the length is max_atom+1] max_atoms is defined in the conf (.yaml file), for mp-20: max_atoms = 20
 
+        # NN for predicting lattice vectors (after Niggli algorithm we have 6 independent lattice variables, so dimension of output is 6) 
+        self.fc_lattice = build_mlp(ind_dim=self.hparams.latent_dim, 
+                                    hidden_dim=self.hparams.hidden_dim,
+                                    fc_num_layers=self.hparams.fc_num_layers, 
+                                    out_dim=6)
+        
+        # NN for the predicted composition, the dimension of output is MAX_ATOMIC_NUM = 100, which means each element will have a corresponding number
+        self.fc_composition = build_mlp(in_dim=self.hparams.latent_dim, 
+                                        hidden_dim=self.hparams.hidden_dim,
+                                        fc_num_layers=self.hparams.fc_num_layers, 
+                                        out_dim=MAX_ATOMIC_NUM)
+        # for property prediction.
+        # output is R^1, which means it is just a number
+        if self.hparams.predict_property:
+            self.fc_property = build_mlp(in_dim=self.hparams.latent_dim, 
+                                         hidden_dim=self.hparams.hidden_dim,
+                                         fc_num_layers=self.hparams.fc_num_layers, 
+                                         out_dim=1)
+
+        # sigmas is a list of all the noises for the Langevin dynamic. The values are evenly distributed in log-scale (log(sigma)).
         sigmas = torch.tensor(np.exp(np.linspace(
             np.log(self.hparams.sigma_begin),
             np.log(self.hparams.sigma_end),
             self.hparams.num_noise_level)), dtype=torch.float32)
 
-        self.sigmas = nn.Parameter(sigmas, requires_grad=False)
+        self.sigmas = nn.Parameter(sigmas, requires_grad=False) # sigma for the coordinates (\sigma_X)
 
         type_sigmas = torch.tensor(np.exp(np.linspace(
             np.log(self.hparams.type_sigma_begin),
             np.log(self.hparams.type_sigma_end),
             self.hparams.num_noise_level)), dtype=torch.float32)
 
-        self.type_sigmas = nn.Parameter(type_sigmas, requires_grad=False)
+        self.type_sigmas = nn.Parameter(type_sigmas, requires_grad=False) # sigma for the type (\sigma_A)
 
-        self.embedding = torch.zeros(100, 92)
+        self.embedding = torch.zeros(100, 92) # in total we have 100 elements, the embedding for each element is a 92-dimensional vector
         for i in range(100):
-            self.embedding[i] = torch.tensor(KHOT_EMBEDDINGS[i + 1])
+            self.embedding[i] = torch.tensor(KHOT_EMBEDDINGS[i + 1]) # KHOT_EMBEDDING is used also in CGCNN
 
         # obtain from datamodule.
+        # Q: I'm not sure what is the purpose of lattice_scaler and scaler
         self.lattice_scaler = None
         self.scaler = None
 
+    # reparameterize is useful for sampling from latent space (z)
+    # z has its mean (mu) and variance (var), but we want to sample from (0,1), hence this function
     def reparameterize(self, mu, logvar):
         """
         Reparameterization trick to sample from N(mu, var) from
@@ -195,12 +236,13 @@ class CDVAE(BaseModule):
         """
         encode crystal structures to latents.
         """
-        hidden = self.encoder(batch)
-        mu = self.fc_mu(hidden)
-        log_var = self.fc_var(hidden)
-        z = self.reparameterize(mu, log_var)
+        hidden = self.encoder(batch) # hidden is a (latent_dim)-dimensional vector (same dimension as z)
+        mu = self.fc_mu(hidden) # mu has same length as z
+        log_var = self.fc_var(hidden) # log_var has same length as z
+        z = self.reparameterize(mu, log_var) # z is the random sample
         return mu, log_var, z
 
+    # Q: What does "gt" mean? (gt means "ground truth", mentioned in below)
     def decode_stats(self, z, gt_num_atoms=None, gt_lengths=None, gt_angles=None,
                      teacher_forcing=False):
         """
@@ -208,19 +250,19 @@ class CDVAE(BaseModule):
         batch is input during training for teach-forcing.
         """
         if gt_num_atoms is not None:
-            num_atoms = self.predict_num_atoms(z)
+            num_atoms = self.predict_num_atoms(z) # predict number of atoms (NN) with z, dimension is max_atoms
             lengths_and_angles, lengths, angles = (
-                self.predict_lattice(z, gt_num_atoms))
-            composition_per_atom = self.predict_composition(z, gt_num_atoms)
+                self.predict_lattice(z, gt_num_atoms)) # predict lattice variables (6 values) with z
+            composition_per_atom = self.predict_composition(z, gt_num_atoms) # predict composition with z, dimension is MAX_ATOMIC_NUM, which is 100
             if self.hparams.teacher_forcing_lattice and teacher_forcing:
                 lengths = gt_lengths
                 angles = gt_angles
         else:
-            num_atoms = self.predict_num_atoms(z).argmax(dim=-1)
+            num_atoms = self.predict_num_atoms(z).argmax(dim=-1) # choosing the larget prediction value 
             lengths_and_angles, lengths, angles = (
                 self.predict_lattice(z, num_atoms))
             composition_per_atom = self.predict_composition(z, num_atoms)
-        return num_atoms, lengths_and_angles, lengths, angles, composition_per_atom
+        return num_atoms, lengths_and_angles, lengths, angles, composition_per_atom # N, L, c ==> AGG network
 
     @torch.no_grad()
     def langevin_dynamics(self, z, ld_kwargs, gt_num_atoms=None, gt_atom_types=None):
@@ -261,14 +303,14 @@ class CDVAE(BaseModule):
         # annealed langevin dynamics.
         for sigma in tqdm(self.sigmas, total=self.sigmas.size(0), disable=ld_kwargs.disable_bar):
             if sigma < ld_kwargs.min_sigma:
-                break
+                break # the ending condition, when the current noise is less than the threshold (min_sigma)
             step_size = ld_kwargs.step_lr * (sigma / self.sigmas[-1]) ** 2
 
             for step in range(ld_kwargs.n_step_each):
                 noise_cart = torch.randn_like(
-                    cur_frac_coords) * torch.sqrt(step_size * 2)
+                    cur_frac_coords) * torch.sqrt(step_size * 2) # generate noise fo coordinates
                 pred_cart_coord_diff, pred_atom_types = self.decoder(
-                    z, cur_frac_coords, cur_atom_types, num_atoms, lengths, angles)
+                    z, cur_frac_coords, cur_atom_types, num_atoms, lengths, angles) # get the s_t and a_t
                 cur_cart_coords = frac_to_cart_coords(
                     cur_frac_coords, lengths, angles, num_atoms)
                 pred_cart_coord_diff = pred_cart_coord_diff / sigma
@@ -299,14 +341,15 @@ class CDVAE(BaseModule):
                 all_noise_cart=torch.stack(all_noise_cart, dim=0),
                 is_traj=True))
 
-        return output_dict
+        return output_dict # output the whole Langevin process
 
     def sample(self, num_samples, ld_kwargs):
         z = torch.randn(num_samples, self.hparams.hidden_dim,
                         device=self.device)
         samples = self.langevin_dynamics(z, ld_kwargs)
-        return samples
+        return samples 
 
+    # for training the entire neural network
     def forward(self, batch, teacher_forcing, training):
         # hacky way to resolve the NaN issue. Will need more careful debugging later.
         mu, log_var, z = self.encode(batch)
@@ -441,6 +484,9 @@ class CDVAE(BaseModule):
         return all_sampled_comp
 
     def predict_num_atoms(self, z):
+        """
+        return is a vector with dimension 1+max_atoms
+        """
         return self.fc_num_atoms(z)
 
     def predict_property(self, z):
@@ -460,8 +506,9 @@ class CDVAE(BaseModule):
         return pred_lengths_and_angles, pred_lengths, pred_angles
 
     def predict_composition(self, z, num_atoms):
-        z_per_atom = z.repeat_interleave(num_atoms, dim=0)
-        pred_composition_per_atom = self.fc_composition(z_per_atom)
+        # Comment: I don't think here is correct, the dimension doesn't fit
+        z_per_atom = z.repeat_interleave(num_atoms, dim=0) # the dimension of z_per_atom is [latent_dim]*num_atoms. Each atom has a latent vector z
+        pred_composition_per_atom = self.fc_composition(z_per_atom) # for each atom there is a value.
         return pred_composition_per_atom
 
     def num_atom_loss(self, pred_num_atoms, batch):
